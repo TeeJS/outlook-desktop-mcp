@@ -150,6 +150,47 @@ def _require_store(namespace, account: str = ""):
 
 # --- Helper: resolve folder by name ---
 
+def _split_folder_path(s: str) -> list:
+    r"""Split a folder path on '/' while honoring backslash escapes.
+
+    Some Outlook folders have literal forward slashes in their name
+    (e.g. 'Qlik/RMM/SAP Alerts', 'SAP/apps'). Because '/' is also the
+    path separator used by this resolver, those names cannot be addressed
+    without an escape syntax.
+
+    Escape rules:
+      - '\\/'  → a literal '/' inside a single segment
+      - '\\\\' → a literal '\\' (backslash) inside a segment
+      - any other backslash is preserved as-is, so existing paths that
+        don't use the escape syntax keep working unchanged.
+
+    Examples:
+      'Inbox/Receipts'                 -> ['Inbox', 'Receipts']
+      'Inbox/Qlik\\/RMM\\/SAP Alerts'  -> ['Inbox', 'Qlik/RMM/SAP Alerts']
+      'Inbox/IT/SAP\\/apps/QlikSense'  -> ['Inbox', 'IT', 'SAP/apps', 'QlikSense']
+      'plain name'                     -> ['plain name']
+    """
+    parts = []
+    buf = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n and s[i + 1] in ("/", "\\"):
+            buf.append(s[i + 1])
+            i += 2
+            continue
+        if c == "/":
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    parts.append("".join(buf).strip())
+    return parts
+
+
 def _walk_folders(parent, name_lower: str):
     """Recursively search subfolders of parent for a folder matching name_lower."""
     try:
@@ -171,45 +212,15 @@ def _walk_folders(parent, name_lower: str):
     return None
 
 
-def _resolve_folder(namespace, folder_name: str, store=None):
-    """Resolve a folder name to an Outlook MAPIFolder object.
+def _resolve_single_folder(namespace, folder_name: str, store):
+    """Resolve a single (already-unescaped) folder name with no path traversal.
 
-    Resolution order:
-    1. Slash-delimited path (e.g. "Inbox/Receipts") — traverse segment by segment
-    2. Built-in Outlook folder enum (inbox, sent, deleted, etc.)
-    3. Root-level folder name match (fast path)
-    4. Recursive depth-first search of entire folder tree (fallback)
-    5. Search folders (virtual/search folders not in regular tree)
+    Lookup order:
+      1. Built-in Outlook folder enum (inbox, sent, deleted, etc.)
+      2. Root-level folder name match (fast path)
+      3. Recursive depth-first search of entire folder tree (fallback)
+      4. Search folders (virtual/search folders not in regular tree)
     """
-    folder_name = folder_name.strip()
-    store = store or namespace.DefaultStore
-
-    # Slash-delimited path: traverse segment by segment
-    if "/" in folder_name:
-        parts = [p.strip() for p in folder_name.split("/")]
-        current = _resolve_folder(namespace, parts[0], store)
-        if current is None:
-            return None
-        for part in parts[1:]:
-            part_lower = part.lower()
-            found = None
-            try:
-                count = current.Folders.Count
-            except Exception:
-                return None
-            for i in range(count):
-                try:
-                    f = current.Folders.Item(i + 1)
-                    if f.Name.lower() == part_lower:
-                        found = f
-                        break
-                except Exception:
-                    continue
-            if found is None:
-                return None
-            current = found
-        return current
-
     folder_lower = folder_name.lower()
 
     # Built-in Outlook folders
@@ -218,7 +229,11 @@ def _resolve_folder(namespace, folder_name: str, store=None):
 
     # Root-level search (fast path)
     root = store.GetRootFolder()
-    for i in range(root.Folders.Count):
+    try:
+        root_count = root.Folders.Count
+    except Exception:
+        root_count = 0
+    for i in range(root_count):
         try:
             f = root.Folders.Item(i + 1)
             if f.Name.lower() == folder_lower:
@@ -246,6 +261,52 @@ def _resolve_folder(namespace, folder_name: str, store=None):
         pass
 
     return None
+
+
+def _resolve_folder(namespace, folder_name: str, store=None):
+    r"""Resolve a folder name to an Outlook MAPIFolder object.
+
+    Accepts:
+      - Plain folder name:        'Inbox'
+      - Built-in alias:           'sent', 'drafts', 'deleted', 'junk'
+      - Slash-delimited path:     'Inbox/Receipts/2026'
+      - Escaped-slash in name:    'Inbox/Qlik\\/RMM\\/SAP Alerts'
+
+    See _split_folder_path for full escape rules.
+    """
+    folder_name = folder_name.strip()
+    store = store or namespace.DefaultStore
+
+    parts = _split_folder_path(folder_name)
+
+    # Multi-segment path: resolve first segment as a top-level name,
+    # then walk children. Each part is already unescaped.
+    if len(parts) > 1:
+        current = _resolve_single_folder(namespace, parts[0], store)
+        if current is None:
+            return None
+        for part in parts[1:]:
+            part_lower = part.lower()
+            found = None
+            try:
+                count = current.Folders.Count
+            except Exception:
+                return None
+            for i in range(count):
+                try:
+                    f = current.Folders.Item(i + 1)
+                    if f.Name.lower() == part_lower:
+                        found = f
+                        break
+                except Exception:
+                    continue
+            if found is None:
+                return None
+            current = found
+        return current
+
+    # Single segment (possibly with embedded literal slashes after unescape)
+    return _resolve_single_folder(namespace, parts[0], store)
 
 
 # =====================================================================
