@@ -87,11 +87,12 @@ def _escape_dasl_value(value: str) -> str:
     return value.replace("'", "''")
 
 
-# PR_SENDER_SMTP_ADDRESS — universal SMTP for both Exchange-internal and
-# external senders. Filtering on this property returns the same SMTP address
-# the user sees, regardless of whether the message came from inside the
-# organization (where [SenderEmailAddress] would otherwise be an X.500 DN).
-_DASL_SENDER_SMTP = '"http://schemas.microsoft.com/mapi/proptag/0x39FE001E"'
+# PR_SENDER_SMTP_ADDRESS_W (Unicode) — universal SMTP for both Exchange-internal
+# and external senders. Property ID 0x5D01, type 0x001F = full proptag
+# 0x5D01001F. Filtering on this property returns the SMTP address the user
+# sees, regardless of whether the message came from inside the organization
+# (where [SenderEmailAddress] would otherwise be an X.500 DN).
+_DASL_SENDER_SMTP = '"http://schemas.microsoft.com/mapi/proptag/0x5D01001F"'
 _DASL_SENDER_NAME = '"urn:schemas:httpmail:fromname"'
 _DASL_DATE_RECEIVED = '"urn:schemas:httpmail:datereceived"'
 _DASL_UNREAD = '"urn:schemas:httpmail:read"'

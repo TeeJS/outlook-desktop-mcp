@@ -57,12 +57,22 @@ class BuildEmailFilterTests(unittest.TestCase):
 
     def test_sender_email_uses_smtp_proptag(self):
         f = _build_email_filter(sender_email="alice@example.com")
-        # PR_SENDER_SMTP_ADDRESS = 0x39FE001E — universal SMTP regardless of
+        # PR_SENDER_SMTP_ADDRESS_W = 0x5D01001F — universal SMTP regardless of
         # whether the sender is Exchange-internal or external.
         self.assertIn(
-            '"http://schemas.microsoft.com/mapi/proptag/0x39FE001E" = \'alice@example.com\'',
+            '"http://schemas.microsoft.com/mapi/proptag/0x5D01001F" = \'alice@example.com\'',
             f,
         )
+
+    def test_all_filters_combined_uses_correct_proptag(self):
+        # Sanity-check that the proptag in the combined filter matches the
+        # one used in the single-filter case (no drift between code paths).
+        f = _build_email_filter(
+            unread_only=True,
+            sender_email="x@y.com",
+        )
+        self.assertIn("0x5D01001F", f)
+        self.assertNotIn("0x39FE001E", f)
 
     def test_sender_email_strips_whitespace(self):
         f = _build_email_filter(sender_email="  alice@example.com  ")
@@ -124,7 +134,7 @@ class BuildEmailFilterTests(unittest.TestCase):
         )
         self.assertTrue(f.startswith("@SQL="))
         self.assertIn(" AND ", f)
-        self.assertIn("0x39FE001E", f)
+        self.assertIn("0x5D01001F", f)
         self.assertIn("datereceived", f)
 
     def test_all_filters_combined(self):
