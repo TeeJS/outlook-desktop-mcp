@@ -55,14 +55,21 @@ class BuildEmailFilterTests(unittest.TestCase):
         f = _build_email_filter(unread_only=True)
         self.assertEqual(f, '@SQL="urn:schemas:httpmail:read" = 0')
 
-    def test_sender_email_uses_smtp_proptag(self):
+    def test_sender_email_uses_smtp_proptag_or_fromemail(self):
+        # sender_email is filtered against TWO properties OR-ed together:
+        # PR_SENDER_SMTP_ADDRESS_W (0x5D01001F) catches mail where Exchange
+        # populated the SMTP proptag; urn:schemas:httpmail:fromemail catches
+        # the rest (where the regular sender-address property holds the SMTP).
         f = _build_email_filter(sender_email="alice@example.com")
-        # PR_SENDER_SMTP_ADDRESS_W = 0x5D01001F — universal SMTP regardless of
-        # whether the sender is Exchange-internal or external.
         self.assertIn(
             '"http://schemas.microsoft.com/mapi/proptag/0x5D01001F" = \'alice@example.com\'',
             f,
         )
+        self.assertIn(
+            '"urn:schemas:httpmail:fromemail" = \'alice@example.com\'',
+            f,
+        )
+        self.assertIn(" OR ", f)
 
     def test_all_filters_combined_uses_correct_proptag(self):
         # Sanity-check that the proptag in the combined filter matches the
@@ -147,9 +154,9 @@ class BuildEmailFilterTests(unittest.TestCase):
             subject_like="urgent",
         )
         self.assertTrue(f.startswith("@SQL="))
-        # All six clauses present, joined by AND.
-        # Count of " AND " separators should be (clauses - 1) where clauses
-        # = unread + 2 date + sender_email + sender_name + subject = 6
+        # Six top-level clauses joined by AND: unread, start, end,
+        # sender_email (itself an OR group), sender_name, subject (also
+        # an OR group internally for subject/body). So " AND " count = 5.
         self.assertEqual(f.count(" AND "), 5)
 
     def test_filter_prefix(self):

@@ -87,12 +87,25 @@ def _escape_dasl_value(value: str) -> str:
     return value.replace("'", "''")
 
 
-# PR_SENDER_SMTP_ADDRESS_W (Unicode) — universal SMTP for both Exchange-internal
-# and external senders. Property ID 0x5D01, type 0x001F = full proptag
-# 0x5D01001F. Filtering on this property returns the SMTP address the user
-# sees, regardless of whether the message came from inside the organization
-# (where [SenderEmailAddress] would otherwise be an X.500 DN).
+# Sender-address filtering uses two DASL fields OR-ed together because no
+# single property is reliably populated across all mail flows:
+#
+#   PR_SENDER_SMTP_ADDRESS_W (proptag 0x5D01001F) — populated on most
+#   modern Exchange-routed mail; contains the SMTP address regardless of
+#   whether the sender is internal or external. NOT always populated for
+#   mail that arrived via certain SMTP relays or non-standard transports.
+#
+#   urn:schemas:httpmail:fromemail — DASL alias for PR_SENDER_EMAIL_ADDRESS
+#   (proptag 0x0C1F001F). Always populated, but is the X.500 DN for
+#   Exchange-internal senders. For external SMTP senders this matches the
+#   SMTP address, so it catches the cases the proptag misses.
+#
+# OR-ing both means sender_email filtering works for any external SMTP
+# sender, regardless of which property got populated. For Exchange-internal
+# senders (where neither field will equal an SMTP literal), callers should
+# use sender_name instead.
 _DASL_SENDER_SMTP = '"http://schemas.microsoft.com/mapi/proptag/0x5D01001F"'
+_DASL_SENDER_EMAIL = '"urn:schemas:httpmail:fromemail"'
 _DASL_SENDER_NAME = '"urn:schemas:httpmail:fromname"'
 _DASL_DATE_RECEIVED = '"urn:schemas:httpmail:datereceived"'
 _DASL_UNREAD = '"urn:schemas:httpmail:read"'
@@ -139,7 +152,12 @@ def _build_email_filter(
         )
     if sender_email:
         escaped = _escape_dasl_value(sender_email.strip())
-        parts.append(f"{_DASL_SENDER_SMTP} = '{escaped}'")
+        # OR across both sender-address properties — see comment near the
+        # _DASL_SENDER_* constants for why both are needed.
+        parts.append(
+            f"({_DASL_SENDER_SMTP} = '{escaped}' OR "
+            f"{_DASL_SENDER_EMAIL} = '{escaped}')"
+        )
     if sender_name:
         escaped = _escape_dasl_value(sender_name.strip())
         parts.append(f"{_DASL_SENDER_NAME} = '{escaped}'")
