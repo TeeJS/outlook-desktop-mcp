@@ -77,6 +77,82 @@ def _safe_dasl(query: str) -> str:
     return query.replace("'", "''").replace('"', '""')
 
 
+def _escape_dasl_value(value: str) -> str:
+    """Escape a value for an exact-match DASL filter literal.
+
+    Doubles single quotes (DASL string escape) but does NOT escape SQL
+    wildcards — use _safe_dasl for LIKE-pattern values where '%' and '_'
+    are user data rather than wildcards.
+    """
+    return value.replace("'", "''")
+
+
+# PR_SENDER_SMTP_ADDRESS — universal SMTP for both Exchange-internal and
+# external senders. Filtering on this property returns the same SMTP address
+# the user sees, regardless of whether the message came from inside the
+# organization (where [SenderEmailAddress] would otherwise be an X.500 DN).
+_DASL_SENDER_SMTP = '"http://schemas.microsoft.com/mapi/proptag/0x39FE001E"'
+_DASL_SENDER_NAME = '"urn:schemas:httpmail:fromname"'
+_DASL_DATE_RECEIVED = '"urn:schemas:httpmail:datereceived"'
+_DASL_UNREAD = '"urn:schemas:httpmail:read"'
+_DASL_SUBJECT = '"urn:schemas:httpmail:subject"'
+_DASL_BODY = '"urn:schemas:httpmail:textdescription"'
+
+
+def _build_email_filter(
+    unread_only: bool = False,
+    start_date: str = "",
+    end_date: str = "",
+    sender_email: str = "",
+    sender_name: str = "",
+    subject_like: str = "",
+) -> str:
+    """Build a DASL @SQL filter for Items.Restrict().
+
+    Returns "" if no filter clauses are needed (caller should skip the
+    Restrict call). All comparisons are AND-ed together.
+
+    Date strings are parsed by _parse_date (ISO 8601). Sender filters use
+    PR_SENDER_SMTP_ADDRESS (universal SMTP) and the From display-name
+    property, so they work for both Exchange-internal and external senders.
+    subject_like is wrapped in '%...%' and OR-ed across subject + body
+    fields, mirroring the existing search_emails behavior.
+    """
+    parts = []
+    if unread_only:
+        parts.append(f"{_DASL_UNREAD} = 0")
+    if start_date:
+        start = _parse_date(start_date)
+        parts.append(
+            f"{_DASL_DATE_RECEIVED} >= '{start.strftime('%m/%d/%Y %H:%M')}'"
+        )
+    if end_date:
+        end = _parse_date(end_date)
+        parts.append(
+            f"{_DASL_DATE_RECEIVED} <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+        )
+    elif start_date:
+        # Default end to now when only start is specified
+        parts.append(
+            f"{_DASL_DATE_RECEIVED} <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
+        )
+    if sender_email:
+        escaped = _escape_dasl_value(sender_email.strip())
+        parts.append(f"{_DASL_SENDER_SMTP} = '{escaped}'")
+    if sender_name:
+        escaped = _escape_dasl_value(sender_name.strip())
+        parts.append(f"{_DASL_SENDER_NAME} = '{escaped}'")
+    if subject_like:
+        escaped = _safe_dasl(subject_like)
+        parts.append(
+            f"({_DASL_SUBJECT} LIKE '%{escaped}%' OR "
+            f"{_DASL_BODY} LIKE '%{escaped}%')"
+        )
+    if not parts:
+        return ""
+    return "@SQL=" + " AND ".join(parts)
+
+
 # Outlook item Class constants (olObjectClass — distinct from olItemType used in CreateItem)
 _OL_CLASS_MAIL = 43
 _OL_CLASS_APPOINTMENT = 26
@@ -485,6 +561,8 @@ async def list_emails(
     unread_only: bool = False,
     start_date: str = "",
     end_date: str = "",
+    sender_email: str = "",
+    sender_name: str = "",
     account: str = "",
 ) -> str:
     """List recent emails from a specified Outlook folder.
@@ -507,13 +585,24 @@ async def list_emails(
             ISO 8601 format (e.g. "2026-03-10" or "2026-03-10 09:00").
         end_date: Optional. Only return emails received on or before this date.
             ISO 8601 format. Default: now (if start_date is provided).
+        sender_email: Optional. Filter to mail whose sender SMTP address
+            equals this value (exact match, case-insensitive on the server
+            side). Uses PR_SENDER_SMTP_ADDRESS, so it works for both
+            Exchange-internal and external senders — you don't need to
+            worry about X.500 distinguished names. Example:
+            "sap_basis_team@nwpipe.com".
+        sender_name: Optional. Filter to mail whose sender display name
+            equals this value (exact match). Useful when an Exchange
+            distribution list shows up with a display name like
+            "Qlikview, Administrator" but no consistent SMTP address.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of email summary objects.
     """
-    def _list(outlook, namespace, folder, count, unread_only, start_date, end_date, account):
+    def _list(outlook, namespace, folder, count, unread_only, start_date,
+              end_date, sender_email, sender_name, account):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
@@ -523,22 +612,15 @@ async def list_emails(
         items = target.Items
         items.Sort("[ReceivedTime]", True)
 
-        # Build restriction filters
-        restrictions = []
-        if unread_only:
-            restrictions.append("[UnRead] = True")
-        if start_date:
-            start = _parse_date(start_date)
-            restrictions.append(f"[ReceivedTime] >= '{start.strftime('%m/%d/%Y %H:%M')}'")
-        if end_date:
-            end = _parse_date(end_date)
-            restrictions.append(f"[ReceivedTime] <= '{end.strftime('%m/%d/%Y %H:%M')}'")
-        elif start_date:
-            # Default end to now when start is specified
-            restrictions.append(f"[ReceivedTime] <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'")
-
-        if restrictions:
-            items = items.Restrict(" AND ".join(restrictions))
+        filter_str = _build_email_filter(
+            unread_only=unread_only,
+            start_date=start_date,
+            end_date=end_date,
+            sender_email=sender_email,
+            sender_name=sender_name,
+        )
+        if filter_str:
+            items = items.Restrict(filter_str)
 
         results = []
         limit = min(count, items.Count)
@@ -550,7 +632,10 @@ async def list_emails(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, folder, count, unread_only, start_date, end_date, account)
+        return await bridge.call(
+            _list, folder, count, unread_only, start_date, end_date,
+            sender_email, sender_name, account,
+        )
     except Exception as e:
         return f"Error listing emails: {format_com_error(e)}"
 
@@ -939,22 +1024,29 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
 
 @mcp.tool()
 async def search_emails(
-    query: str,
+    query: str = "",
     folder: str = "inbox",
     count: int = 10,
     start_date: str = "",
     end_date: str = "",
+    sender_email: str = "",
+    sender_name: str = "",
     account: str = "",
 ) -> str:
-    """Search for emails in Outlook using text search.
+    """Search for emails in Outlook by text, sender, and/or date range.
 
-    Searches email subjects and bodies using Outlook's DASL filter.
-    Results are sorted by received time (newest first). Each result
-    includes entry_id for further operations.
+    All supplied filters are AND-ed together. Results are sorted by
+    received time (newest first). Each result includes entry_id for
+    further operations.
+
+    At least one of `query`, `sender_email`, or `sender_name` must be
+    provided — an empty search would otherwise return every message in
+    the folder, which is not what callers want.
 
     Args:
-        query: The search term (case-insensitive substring match).
-            Examples: "budget report", "meeting notes", "quarterly".
+        query: Optional text term (case-insensitive substring match
+            against subject + body). Examples: "budget report",
+            "meeting notes". Leave empty when filtering purely by sender.
         folder: Folder to search in. Default "inbox". Supports same
             names as list_emails.
         count: Maximum results to return. Default 10.
@@ -962,40 +1054,38 @@ async def search_emails(
             ISO 8601 format (e.g. "2026-03-10" or "2026-03-10 09:00").
         end_date: Optional. Only return emails received on or before this date.
             ISO 8601 format. Default: now (if start_date is provided).
+        sender_email: Optional. Filter to mail whose sender SMTP address
+            equals this value. Uses PR_SENDER_SMTP_ADDRESS, so it works
+            for both Exchange-internal and external senders.
+        sender_name: Optional. Filter to mail whose sender display name
+            equals this value (exact match). Useful for Exchange
+            distribution lists with no consistent SMTP address.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
 
     Returns:
         JSON array of matching email summaries, or an error.
     """
-    def _search(outlook, namespace, query, folder, count, start_date, end_date, account):
+    def _search(outlook, namespace, query, folder, count, start_date,
+                end_date, sender_email, sender_name, account):
+        if not (query or sender_email or sender_name):
+            return json.dumps({
+                "error": "search_emails requires at least one of "
+                         "query, sender_email, or sender_name."
+            })
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
         if not target:
             return json.dumps({"error": f"Folder '{folder}' not found"})
 
-        safe_query = _safe_dasl(query)
-        dasl_parts = [
-            f"(\"urn:schemas:httpmail:subject\" LIKE '%{safe_query}%' OR "
-            f"\"urn:schemas:httpmail:textdescription\" LIKE '%{safe_query}%')"
-        ]
-        if start_date:
-            start = _parse_date(start_date)
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= '{start.strftime('%m/%d/%Y %H:%M')}'"
-            )
-        if end_date:
-            end = _parse_date(end_date)
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{end.strftime('%m/%d/%Y %H:%M')}'"
-            )
-        elif start_date:
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
-            )
-
-        filter_str = "@SQL=" + " AND ".join(dasl_parts)
+        filter_str = _build_email_filter(
+            start_date=start_date,
+            end_date=end_date,
+            sender_email=sender_email,
+            sender_name=sender_name,
+            subject_like=query,
+        )
         items = target.Items.Restrict(filter_str)
         items.Sort("[ReceivedTime]", True)
 
@@ -1009,7 +1099,10 @@ async def search_emails(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, folder, count, start_date, end_date, account)
+        return await bridge.call(
+            _search, query, folder, count, start_date, end_date,
+            sender_email, sender_name, account,
+        )
     except Exception as e:
         return f"Error searching emails: {format_com_error(e)}"
 
