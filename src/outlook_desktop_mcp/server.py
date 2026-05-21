@@ -87,29 +87,32 @@ def _escape_dasl_value(value: str) -> str:
     return value.replace("'", "''")
 
 
-# Sender-address filtering uses two DASL fields OR-ed together because no
-# single property is reliably populated across all mail flows:
+# Filter fields. We use the simple [Field] reference syntax wherever a
+# direct Outlook property exists, because:
 #
-#   PR_SENDER_SMTP_ADDRESS_W (proptag 0x5D01001F) — populated on most
-#   modern Exchange-routed mail; contains the SMTP address regardless of
-#   whether the sender is internal or external. NOT always populated for
-#   mail that arrived via certain SMTP relays or non-standard transports.
+#   1. The same syntax works in both simple Restrict (no @SQL prefix) and
+#      DASL @SQL filters.
+#   2. Empirically the DASL URL forms for sender properties
+#      (urn:schemas:httpmail:fromemail and the PR_SENDER_SMTP_ADDRESS
+#      proptag 0x5D01001F) are unreliable — some mail flows populate
+#      neither, even when [SenderEmailAddress] (the Outlook COM property)
+#      clearly holds the SMTP. Field-reference form reads through Outlook's
+#      object-model accessor and matches what `item.SenderEmailAddress`
+#      would return for the same item.
 #
-#   urn:schemas:httpmail:fromemail — DASL alias for PR_SENDER_EMAIL_ADDRESS
-#   (proptag 0x0C1F001F). Always populated, but is the X.500 DN for
-#   Exchange-internal senders. For external SMTP senders this matches the
-#   SMTP address, so it catches the cases the proptag misses.
+# Caveat: [SenderEmailAddress] returns the X.500 DN for Exchange-internal
+# senders. For those, callers should use sender_name (matches the display
+# name, which is universally populated).
 #
-# OR-ing both means sender_email filtering works for any external SMTP
-# sender, regardless of which property got populated. For Exchange-internal
-# senders (where neither field will equal an SMTP literal), callers should
-# use sender_name instead.
-_DASL_SENDER_SMTP = '"http://schemas.microsoft.com/mapi/proptag/0x5D01001F"'
-_DASL_SENDER_EMAIL = '"urn:schemas:httpmail:fromemail"'
-_DASL_SENDER_NAME = '"urn:schemas:httpmail:fromname"'
-_DASL_DATE_RECEIVED = '"urn:schemas:httpmail:datereceived"'
-_DASL_UNREAD = '"urn:schemas:httpmail:read"'
-_DASL_SUBJECT = '"urn:schemas:httpmail:subject"'
+# The body-content search in search_emails still requires the DASL URL form
+# (urn:schemas:httpmail:textdescription) because body content isn't a
+# simple Outlook property; that forces the whole filter to use @SQL DASL
+# syntax when subject_like is set.
+_FIELD_SENDER_EMAIL = "[SenderEmailAddress]"
+_FIELD_SENDER_NAME = "[SenderName]"
+_FIELD_DATE_RECEIVED = "[ReceivedTime]"
+_FIELD_UNREAD = "[UnRead]"
+_FIELD_SUBJECT = "[Subject]"
 _DASL_BODY = '"urn:schemas:httpmail:textdescription"'
 
 
@@ -121,55 +124,62 @@ def _build_email_filter(
     sender_name: str = "",
     subject_like: str = "",
 ) -> str:
-    """Build a DASL @SQL filter for Items.Restrict().
+    """Build a Restrict filter string for Items.Restrict().
 
     Returns "" if no filter clauses are needed (caller should skip the
     Restrict call). All comparisons are AND-ed together.
 
-    Date strings are parsed by _parse_date (ISO 8601). Sender filters use
-    PR_SENDER_SMTP_ADDRESS (universal SMTP) and the From display-name
-    property, so they work for both Exchange-internal and external senders.
-    subject_like is wrapped in '%...%' and OR-ed across subject + body
-    fields, mirroring the existing search_emails behavior.
+    The returned filter uses simple [Field] reference syntax wherever
+    possible. When subject_like is supplied (body content search), the
+    result is prefixed with "@SQL=" to switch Outlook into DASL mode —
+    body content can only be queried via the DASL URL form.
+
+    Sender filters use the [SenderEmailAddress] and [SenderName] Outlook
+    object-model properties. [SenderEmailAddress] is the SMTP for external
+    senders and the X.500 DN for Exchange-internal senders; for internal
+    senders the caller should use sender_name instead.
     """
     parts = []
     if unread_only:
-        parts.append(f"{_DASL_UNREAD} = 0")
+        parts.append(f"{_FIELD_UNREAD} = True")
     if start_date:
         start = _parse_date(start_date)
         parts.append(
-            f"{_DASL_DATE_RECEIVED} >= '{start.strftime('%m/%d/%Y %H:%M')}'"
+            f"{_FIELD_DATE_RECEIVED} >= '{start.strftime('%m/%d/%Y %H:%M')}'"
         )
     if end_date:
         end = _parse_date(end_date)
         parts.append(
-            f"{_DASL_DATE_RECEIVED} <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"{_FIELD_DATE_RECEIVED} <= '{end.strftime('%m/%d/%Y %H:%M')}'"
         )
     elif start_date:
         # Default end to now when only start is specified
         parts.append(
-            f"{_DASL_DATE_RECEIVED} <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
+            f"{_FIELD_DATE_RECEIVED} <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
         )
     if sender_email:
         escaped = _escape_dasl_value(sender_email.strip())
-        # OR across both sender-address properties — see comment near the
-        # _DASL_SENDER_* constants for why both are needed.
-        parts.append(
-            f"({_DASL_SENDER_SMTP} = '{escaped}' OR "
-            f"{_DASL_SENDER_EMAIL} = '{escaped}')"
-        )
+        parts.append(f"{_FIELD_SENDER_EMAIL} = '{escaped}'")
     if sender_name:
         escaped = _escape_dasl_value(sender_name.strip())
-        parts.append(f"{_DASL_SENDER_NAME} = '{escaped}'")
+        parts.append(f"{_FIELD_SENDER_NAME} = '{escaped}'")
+
     if subject_like:
+        # Body search forces DASL @SQL because urn:schemas:httpmail:textdescription
+        # is not a simple Outlook property. Subject can stay in [Field] form
+        # since both syntaxes coexist inside @SQL.
         escaped = _safe_dasl(subject_like)
         parts.append(
-            f"({_DASL_SUBJECT} LIKE '%{escaped}%' OR "
+            f"({_FIELD_SUBJECT} LIKE '%{escaped}%' OR "
             f"{_DASL_BODY} LIKE '%{escaped}%')"
         )
+        prefix = "@SQL="
+    else:
+        prefix = ""
+
     if not parts:
         return ""
-    return "@SQL=" + " AND ".join(parts)
+    return prefix + " AND ".join(parts)
 
 
 # Outlook item Class constants (olObjectClass — distinct from olItemType used in CreateItem)

@@ -1,5 +1,5 @@
 """
-Unit tests for _escape_dasl_value and _build_email_filter — the DASL @SQL
+Unit tests for _escape_dasl_value and _build_email_filter — the Restrict
 filter construction used by list_emails and search_emails.
 
 These tests do not require Outlook to be running.
@@ -49,37 +49,18 @@ class BuildEmailFilterTests(unittest.TestCase):
     def test_no_clauses_returns_empty(self):
         self.assertEqual(_build_email_filter(), "")
 
-    # --- Individual clause shapes ---
+    # --- Simple-Restrict mode (no subject_like) ---
 
-    def test_unread_only(self):
+    def test_unread_only_no_dasl_prefix(self):
+        # Without subject_like, no @SQL= prefix needed; uses simple Restrict.
         f = _build_email_filter(unread_only=True)
-        self.assertEqual(f, '@SQL="urn:schemas:httpmail:read" = 0')
+        self.assertEqual(f, "[UnRead] = True")
 
-    def test_sender_email_uses_smtp_proptag_or_fromemail(self):
-        # sender_email is filtered against TWO properties OR-ed together:
-        # PR_SENDER_SMTP_ADDRESS_W (0x5D01001F) catches mail where Exchange
-        # populated the SMTP proptag; urn:schemas:httpmail:fromemail catches
-        # the rest (where the regular sender-address property holds the SMTP).
+    def test_sender_email_uses_field_reference(self):
+        # [SenderEmailAddress] reads through Outlook's COM property accessor
+        # — same value the rest of the codebase sees as item.SenderEmailAddress.
         f = _build_email_filter(sender_email="alice@example.com")
-        self.assertIn(
-            '"http://schemas.microsoft.com/mapi/proptag/0x5D01001F" = \'alice@example.com\'',
-            f,
-        )
-        self.assertIn(
-            '"urn:schemas:httpmail:fromemail" = \'alice@example.com\'',
-            f,
-        )
-        self.assertIn(" OR ", f)
-
-    def test_all_filters_combined_uses_correct_proptag(self):
-        # Sanity-check that the proptag in the combined filter matches the
-        # one used in the single-filter case (no drift between code paths).
-        f = _build_email_filter(
-            unread_only=True,
-            sender_email="x@y.com",
-        )
-        self.assertIn("0x5D01001F", f)
-        self.assertNotIn("0x39FE001E", f)
+        self.assertEqual(f, "[SenderEmailAddress] = 'alice@example.com'")
 
     def test_sender_email_strips_whitespace(self):
         f = _build_email_filter(sender_email="  alice@example.com  ")
@@ -92,19 +73,48 @@ class BuildEmailFilterTests(unittest.TestCase):
 
     def test_sender_name(self):
         f = _build_email_filter(sender_name="Qlikview, Administrator")
-        self.assertIn(
-            "\"urn:schemas:httpmail:fromname\" = 'Qlikview, Administrator'",
-            f,
+        self.assertEqual(f, "[SenderName] = 'Qlikview, Administrator'")
+
+    def test_start_date_only_adds_end_now(self):
+        f = _build_email_filter(start_date="2026-01-01")
+        # Without subject_like, simple Restrict (no @SQL prefix). Two
+        # date clauses (the >= start and the implicit <= now).
+        self.assertFalse(f.startswith("@SQL="))
+        self.assertEqual(f.count("[ReceivedTime]"), 2)
+        self.assertIn(">= '01/01/2026 00:00'", f)
+        self.assertIn("<= '", f)
+
+    def test_end_date_only_no_implicit_start(self):
+        f = _build_email_filter(end_date="2026-01-01")
+        self.assertEqual(f, "[ReceivedTime] <= '01/01/2026 00:00'")
+
+    def test_explicit_start_and_end(self):
+        f = _build_email_filter(start_date="2026-01-01", end_date="2026-02-01")
+        self.assertIn(">= '01/01/2026 00:00'", f)
+        self.assertIn("<= '02/01/2026 00:00'", f)
+        self.assertIn(" AND ", f)
+
+    def test_sender_plus_date_simple_restrict(self):
+        f = _build_email_filter(
+            sender_email="bot@example.com",
+            end_date="2026-05-20",
         )
+        self.assertFalse(f.startswith("@SQL="))
+        self.assertIn("[SenderEmailAddress] = 'bot@example.com'", f)
+        self.assertIn("[ReceivedTime] <= '05/20/2026 00:00'", f)
+        self.assertIn(" AND ", f)
+
+    # --- DASL mode (subject_like forces @SQL= prefix) ---
+
+    def test_subject_like_forces_dasl_prefix(self):
+        f = _build_email_filter(subject_like="invoice")
+        self.assertTrue(f.startswith("@SQL="))
 
     def test_subject_like_wraps_with_percent(self):
         f = _build_email_filter(subject_like="invoice")
+        self.assertIn("[Subject] LIKE '%invoice%'", f)
         self.assertIn(
-            '"urn:schemas:httpmail:subject" LIKE \'%invoice%\'',
-            f,
-        )
-        self.assertIn(
-            '"urn:schemas:httpmail:textdescription" LIKE \'%invoice%\'',
+            "\"urn:schemas:httpmail:textdescription\" LIKE '%invoice%'",
             f,
         )
 
@@ -113,36 +123,14 @@ class BuildEmailFilterTests(unittest.TestCase):
         f = _build_email_filter(subject_like="100%")
         self.assertIn("[%]", f)
 
-    def test_start_date_only_adds_end_now(self):
-        # When only start_date is provided, end_date defaults to "now".
-        # Verify both >= and <= clauses are present.
-        f = _build_email_filter(start_date="2026-01-01")
-        self.assertEqual(f.count("datereceived"), 2)
-        self.assertIn(">= '01/01/2026 00:00'", f)
-        self.assertIn("<= '", f)
-
-    def test_end_date_only_no_implicit_start(self):
-        f = _build_email_filter(end_date="2026-01-01")
-        self.assertEqual(f.count("datereceived"), 1)
-        self.assertIn("<= '01/01/2026 00:00'", f)
-        self.assertNotIn(">= '", f)
-
-    def test_explicit_start_and_end(self):
-        f = _build_email_filter(start_date="2026-01-01", end_date="2026-02-01")
-        self.assertIn(">= '01/01/2026 00:00'", f)
-        self.assertIn("<= '02/01/2026 00:00'", f)
-
-    # --- Combined filters AND-ed together ---
-
-    def test_sender_plus_date(self):
+    def test_subject_plus_sender_combined_dasl(self):
         f = _build_email_filter(
+            subject_like="urgent",
             sender_email="bot@example.com",
-            end_date="2026-05-20",
         )
         self.assertTrue(f.startswith("@SQL="))
-        self.assertIn(" AND ", f)
-        self.assertIn("0x5D01001F", f)
-        self.assertIn("datereceived", f)
+        self.assertIn("[SenderEmailAddress] = 'bot@example.com'", f)
+        self.assertIn("[Subject] LIKE '%urgent%'", f)
 
     def test_all_filters_combined(self):
         f = _build_email_filter(
@@ -155,14 +143,8 @@ class BuildEmailFilterTests(unittest.TestCase):
         )
         self.assertTrue(f.startswith("@SQL="))
         # Six top-level clauses joined by AND: unread, start, end,
-        # sender_email (itself an OR group), sender_name, subject (also
-        # an OR group internally for subject/body). So " AND " count = 5.
+        # sender_email, sender_name, subject_or_body. " AND " count = 5.
         self.assertEqual(f.count(" AND "), 5)
-
-    def test_filter_prefix(self):
-        # Any non-empty filter must start with @SQL=.
-        f = _build_email_filter(sender_email="x@y.com")
-        self.assertTrue(f.startswith("@SQL="))
 
 
 if __name__ == "__main__":
